@@ -122,7 +122,7 @@ test('API: list with filters and cursor, stats, overview, metrics', async (t) =>
   assert.equal(st.total, 2);
   assert.equal(st.clicks, 3);
   assert.equal(st.bots, 1);
-  assert.equal(st.visitors, 2, 'same address+agent counted once');
+  assert.equal(st.visitors, 1, 'same address+agent counted once, bots excluded');
   assert.deepEqual(st.byReferrer.map((/** @type {any} */ r) => r.referrer).sort(), [null, 'a.example'].sort());
   assert.equal(st.recent.length, 3);
   assert.match(st.since, /^\d{4}-/);
