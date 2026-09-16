@@ -22,7 +22,7 @@ slcurl "$SL/v1/links/spring/stats?days=30"
 |---|---|
 | `total` | Counted clicks over the link's whole life (bots excluded); the same number as `clicks` on the link object. Survives click-log retention. |
 | `clicks` | Rows in the click log for the window, bots included. |
-| `visitors` | Distinct visitor hashes in the window (same address and browser = one visitor). |
+| `visitors` | Distinct visitor hashes in the window, bots excluded (same address and browser = one visitor). |
 | `bots` | Requests classified as crawler, link checker or preview fetcher. |
 | `byDay` | Per UTC day, bots excluded. Days without clicks are absent. |
 | `byReferrer` | Referrer **host**, top 10, bots excluded. `null` means no referrer: typed, from an app, or from a QR scan. |

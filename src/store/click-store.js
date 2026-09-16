@@ -7,7 +7,7 @@ export class ClickStore {
   constructor(db) {
     this.stmt = {
       insert: db.prepare(`INSERT INTO clicks (code, at, visitor, referrer, device) VALUES (?, ?, ?, ?, ?)`),
-      totals: db.prepare(`SELECT COUNT(*) AS clicks, COUNT(DISTINCT visitor) AS visitors, SUM(CASE WHEN device = 'bot' THEN 1 ELSE 0 END) AS bots FROM clicks WHERE code = ? AND at >= ?`),
+      totals: db.prepare(`SELECT COUNT(*) AS clicks, COUNT(DISTINCT CASE WHEN device <> 'bot' THEN visitor END) AS visitors, SUM(CASE WHEN device = 'bot' THEN 1 ELSE 0 END) AS bots FROM clicks WHERE code = ? AND at >= ?`),
       byDay: db.prepare(`SELECT (at / 86400000) * 86400000 AS day, COUNT(*) AS clicks, COUNT(DISTINCT visitor) AS visitors FROM clicks WHERE code = ? AND at >= ? AND device <> 'bot' GROUP BY day ORDER BY day`),
       byReferrer: db.prepare(`SELECT COALESCE(referrer, '') AS referrer, COUNT(*) AS n FROM clicks WHERE code = ? AND at >= ? AND device <> 'bot' GROUP BY referrer ORDER BY n DESC LIMIT 10`),
       byDevice: db.prepare(`SELECT device, COUNT(*) AS n FROM clicks WHERE code = ? AND at >= ? GROUP BY device`),

@@ -20,7 +20,7 @@ export class LinkStore {
         COUNT(*) AS total,
         SUM(CASE WHEN enabled = 1 AND (expires_at IS NULL OR expires_at > ?) AND (max_clicks IS NULL OR clicks < max_clicks) THEN 1 ELSE 0 END) AS active,
         SUM(clicks) AS clicks FROM links`),
-      top: db.prepare(`SELECT l.code, l.url, COUNT(c.id) AS n FROM clicks c JOIN links l ON l.code = c.code WHERE c.at >= ? GROUP BY l.code ORDER BY n DESC LIMIT ?`),
+      top: db.prepare(`SELECT l.code, l.url, COUNT(c.id) AS n FROM clicks c JOIN links l ON l.code = c.code WHERE c.at >= ? AND c.device <> 'bot' GROUP BY l.code ORDER BY n DESC LIMIT ?`),
     };
     /** @type {Map<string, import('node:sqlite').StatementSync>} */
     this.cache = new Map();

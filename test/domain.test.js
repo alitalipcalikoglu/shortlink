@@ -81,7 +81,7 @@ test('LinkService: follow records clicks, bots do not consume the limit, gone st
   const st = service.stats('limited', 30, now + 10);
   assert.equal(st.total, 2);
   assert.equal(st.clicks, 3, 'log counts bots');
-  assert.equal(st.visitors, 3);
+  assert.equal(st.visitors, 2, 'bots are not visitors');
   assert.equal(st.bots, 1);
   assert.deepEqual(st.byDevice, { bot: 1, desktop: 2 });
   assert.deepEqual(st.byReferrer, [{ referrer: 'news.example', clicks: 2 }]);
