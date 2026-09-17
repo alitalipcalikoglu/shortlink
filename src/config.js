@@ -97,7 +97,7 @@ export class Config {
    * @returns {ApiKey[]}
    */
   static #parseApiKeys(raw) {
-    return parseApiKeys(raw, 'SHORTLINK_API_KEYS', { roles: ['read', 'write', 'readwrite'], minSecretLength: Config.MIN_SECRET_LENGTH })
+    return parseApiKeys(raw, 'SHORTLINK_API_KEYS', { roles: ['read', 'write', 'readwrite'], minSecretLength: Config.MIN_SECRET_LENGTH, roleErrorMessage: () => 'must be read, write or readwrite' })
       .map(({ id, secret, role }) => ({ id, secret, role: /** @type {KeyRole} */ (role) }));
   }
 }
