@@ -124,6 +124,30 @@ Class-based; dependencies are injected through constructors, `src/application.js
 
 With `AUDIT_URL` and `AUDIT_API_KEY` set, every completed write request is forwarded to the audit service as one event (`success`, or `denied` on 403) with the calling key as actor, the affected entity as target, client IP, user agent and request id. Events are buffered and sent in batches; the audit service being down never fails a request. Actions: see [examples/audit-events.md](examples/audit-events.md).
 
+## Scaling model
+
+One process owns one SQLite file (`instances: 1`). Create/list/stats paths would stay consistent
+across two instances thanks to SQLite's own write locking, but the public redirect path is not: it
+reads a link's click count, decides whether `maxClicks` still allows it, and only then writes —  a
+classic read-then-write, not a conditional `UPDATE`. Single-process traffic can't race this (no
+`await` between the read and the write), but two processes sharing one file could push a link's
+click count past `maxClicks`. See [docs/READINESS.md](docs/READINESS.md) for the full contract.
+
+## Observability
+
+Requests are logged with `reqId` (accepts or generates `X-Request-Id`; no `traceparent` support —
+gateway-only so far). `/health` is a static check; `/ready` pings the database, cached for 10s, and
+never mutates state. `/metrics` numbers are all live database reads, so they don't reset on restart
+or diverge between processes. See [docs/READINESS.md](docs/READINESS.md) for the full contract.
+
+## Backup / restore
+
+The only state to protect is the SQLite file at `DB_PATH` (default `./data/shortlink.db`, plus its
+WAL sidecars while running). There is no backup script in this repository today; capture the file
+directly (stopped, or via SQLite's online backup) and restore by replacing it before starting the
+service — migrations reapply automatically on start. See [docs/READINESS.md](docs/READINESS.md) for
+the full contract.
+
 ## License
 
 MIT, see [LICENSE](LICENSE).
