@@ -57,7 +57,7 @@ Errors are JSON: `{ "error": { "code", "message", "details?" } }`.
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
-| GET | `/health`, `/ready` | none | Liveness; readiness (database, cached 10 s). |
+| GET | `/health`, `/ready`, `/v1/info` | none | Liveness; readiness (database, cached 10 s); service identity (version, API version, capabilities, schema version, service-core version). |
 | GET | `/:code` | none | Redirect (`302`, or `301` when permanent). `HEAD` too. `404` unknown, `410` gone. |
 | GET | `/:code+` | none | Preview page. |
 | GET | `/:code/qr` | none | QR of the short URL, `format=svg|png`, `scale=1..20`, `margin=0..8`. Active links only. |
