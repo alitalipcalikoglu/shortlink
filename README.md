@@ -143,10 +143,17 @@ or diverge between processes. See [docs/READINESS.md](docs/READINESS.md) for the
 ## Backup / restore
 
 The only state to protect is the SQLite file at `DB_PATH` (default `./data/shortlink.db`, plus its
-WAL sidecars while running). There is no backup script in this repository today; capture the file
-directly (stopped, or via SQLite's online backup) and restore by replacing it before starting the
-service — migrations reapply automatically on start. See [docs/READINESS.md](docs/READINESS.md) for
-the full contract.
+WAL sidecars while running). Use `stack backup`/`stack restore` from the workspace root (see
+`stack/docs/UPGRADE.md`) to snapshot and restore this consistently alongside the rest of the stack.
+On every start, before applying a pending migration to an existing database, the service itself
+also snapshots the file to `DB_PATH.pre-v<N>-<timestamp>` (directory overridable with
+`DB_BACKUP_DIR`) — a manual last resort if `stack restore` is unavailable; migrations reapply
+automatically on start either way.
+
+**Rollback limitations:** none of the migrations are reversible; to roll back, restore the
+pre-migration copy (or a `stack backup` snapshot taken before the upgrade) and run the previous
+version of this service against it. See [docs/READINESS.md](docs/READINESS.md) for the full
+contract.
 
 ## License
 

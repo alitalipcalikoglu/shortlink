@@ -18,7 +18,7 @@ export class Application {
   constructor(config) {
     this.config = config;
     this.audit = new AuditClient({ target: config.audit });
-    this.db = new Database(config.dbPath);
+    this.db = new Database(config.dbPath, { backupDir: config.dbBackupDir });
     this.links = new LinkStore(this.db);
     this.clicks = new ClickStore(this.db);
     this.service = new LinkService({
