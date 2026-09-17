@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { readServiceVersion } from '@atc-web/service-core/fastify';
 import { Maintenance } from '../src/maintenance.js';
 import { BASE, READ_KEY, RW_KEY, WRITE_KEY, bearer, buildApp } from './helpers.js';
 
@@ -21,6 +22,19 @@ test('API: probes, auth, roles, robots', async (t) => {
   assert.equal(json(nf).error.code, 'LINK_NOT_FOUND');
   assert.equal((await app.inject({ url: '/x' })).statusCode, 404, 'too short for a code');
   assert.equal((await app.inject({ url: '/health' })).headers['x-content-type-options'], 'nosniff');
+});
+
+test('API: /v1/info', async (t) => {
+  const version = readServiceVersion(import.meta.url);
+  const { app } = await buildApp();
+  t.after(() => app.close());
+  const info = json(await app.inject({ url: '/v1/info' }));
+  assert.equal(info.service, 'shortlink');
+  assert.equal(info.version, version);
+  assert.equal(info.apiVersion, 'v1');
+  assert.deepEqual(info.capabilities, ['qr-codes', 'click-limits']);
+  assert.equal(typeof info.schemaVersion, 'number');
+  assert.equal(typeof info.serviceCore, 'string');
 });
 
 test('API: create, redirect, preview, head, gone states, delete', async (t) => {

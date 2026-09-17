@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import rateLimit from '@fastify/rate-limit';
 import Fastify from 'fastify';
 import { AuditClient } from '@atc-web/service-core/audit';
-import { createErrorHandler, registerProbes } from '@atc-web/service-core/fastify';
+import { createErrorHandler, registerInfo, registerProbes } from '@atc-web/service-core/fastify';
 import { LinkError } from '../domain/errors.js';
 import { LinkService } from '../domain/link-service.js';
 import { Slug } from '../domain/slug.js';
@@ -33,16 +33,18 @@ export class ShortlinkApi {
    * @param {import('../store/link-store.js').LinkStore} deps.links
    * @param {import('../store/click-store.js').ClickStore} deps.clicks
    * @param {import('../db.js').Database} deps.db
+   * @param {string} deps.version
    * @param {import('../types.js').Logger} [deps.logger]
    * @param {import('@atc-web/service-core/audit').AuditClient} [deps.audit]
    */
-  constructor({ config, audit, service, links, clicks, db, logger }) {
+  constructor({ config, audit, service, links, clicks, db, version, logger }) {
     this.config = config;
     this.audit = audit;
     this.service = service;
     this.links = links;
     this.clicks = clicks;
     this.db = db;
+    this.version = version;
     this.logger = logger;
     this.auth = new ApiKeyAuth(config.apiKeys);
     this.views = new Views(config.publicBaseUrl);
@@ -78,6 +80,12 @@ export class ShortlinkApi {
       if (!reply.hasHeader('cache-control')) reply.header('cache-control', 'no-store');
     });
     registerProbes(app, () => this.db.ping(), { cacheMs: ShortlinkApi.READY_CACHE_MS });
+    registerInfo(app, {
+      service: 'shortlink',
+      version: this.version,
+      capabilities: ['qr-codes', 'click-limits'],
+      schemaVersion: this.db.schemaVersion,
+    });
     app.get('/robots.txt', { logLevel: 'warn' }, async (_request, reply) => {
       reply.type('text/plain; charset=utf-8').header('cache-control', 'public, max-age=86400');
       return 'User-agent: *\nDisallow: /\n';

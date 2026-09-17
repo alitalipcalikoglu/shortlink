@@ -43,6 +43,14 @@ npm run typecheck
 - **QR**: `/<code>/qr` (public, SVG or PNG) and `/v1/qr?text=` (any text, up to 213 bytes). Strong ETag, one-day cache.
 - **Keys** are `id:secret[:role]`; the id becomes `createdBy`. Roles `read`, `write`, `readwrite`.
 
+## Boundaries
+
+**Purpose:** short URLs with click tracking.
+
+**Responsibilities:** create/manage links; redirect; click counting; expiry and max-click limits; QR codes.
+
+**Non-responsibilities:** not an analytics platform — click counts only, no referrer/funnel analysis. The max-click limit is currently enforced by a read-then-write check, not an atomic SQL guard — a known race under heavy concurrent hits on the same code, tracked as a pre-existing gap and not changed here. Not a general redirect/proxy service beyond its own link table.
+
 ## API
 
 Errors are JSON: `{ "error": { "code", "message", "details?" } }`.
