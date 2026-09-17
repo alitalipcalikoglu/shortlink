@@ -120,6 +120,10 @@ Class-based; dependencies are injected through constructors, `src/application.js
 - QR codes above 213 bytes, logos or colours: shorten first, style the SVG downstream.
 - Bulk import: loop over `POST /v1/links`; the per-key rate limit (600/min) is the only bound.
 
+## Audit events
+
+With `AUDIT_URL` and `AUDIT_API_KEY` set, every completed write request is forwarded to the audit service as one event (`success`, or `denied` on 403) with the calling key as actor, the affected entity as target, client IP, user agent and request id. Events are buffered and sent in batches; the audit service being down never fails a request. Actions: see [examples/audit-events.md](examples/audit-events.md).
+
 ## License
 
 MIT, see [LICENSE](LICENSE).

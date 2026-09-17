@@ -42,10 +42,10 @@ export function testService(overrides) {
   return { config, db, links, clicks, service };
 }
 
-/** Fully wired Fastify app. @param {Record<string, string>} [overrides] */
-export async function buildApp(overrides) {
+/** Fully wired Fastify app. @param {Record<string, string>} [overrides] @param {object} [deps] Extra constructor deps, e.g. an AuditClient. */
+export async function buildApp(overrides, deps = {}) {
   const t = testService(overrides);
-  const app = await new ShortlinkApi({ ...t }).build();
+  const app = await new ShortlinkApi({ ...t, ...deps }).build();
   await app.ready();
   return { app, ...t };
 }

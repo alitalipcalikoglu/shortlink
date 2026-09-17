@@ -6,4 +6,7 @@ declare module 'fastify' {
     apiKeyId: string;
     apiKeyRole: import('./types.js').KeyRole;
   }
+  interface FastifyContextConfig {
+    audit?: import('./net/audit-client.js').AuditRouteConfig;
+  }
 }

@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import rateLimit from '@fastify/rate-limit';
 import Fastify from 'fastify';
+import { AuditClient } from '../net/audit-client.js';
 import { LinkError } from '../domain/errors.js';
 import { LinkService } from '../domain/link-service.js';
 import { Slug } from '../domain/slug.js';
@@ -32,9 +33,11 @@ export class ShortlinkApi {
    * @param {import('../store/click-store.js').ClickStore} deps.clicks
    * @param {import('../db.js').Database} deps.db
    * @param {import('../types.js').Logger} [deps.logger]
+   * @param {import('../net/audit-client.js').AuditClient} [deps.audit]
    */
-  constructor({ config, service, links, clicks, db, logger }) {
+  constructor({ config, audit, service, links, clicks, db, logger }) {
     this.config = config;
+    this.audit = audit;
     this.service = service;
     this.links = links;
     this.clicks = clicks;
@@ -61,6 +64,7 @@ export class ShortlinkApi {
     app.decorateRequest('apiKeyId', '');
     app.decorateRequest('apiKeyRole', 'read');
     app.setErrorHandler(this.#errorHandler);
+    app.addHook('onSend', AuditClient.hook(this.audit));
     app.setNotFoundHandler((_request, reply) => {
       reply.code(404).send({ error: { code: 'NOT_FOUND', message: 'route not found' } });
     });
@@ -159,7 +163,7 @@ export class ShortlinkApi {
     const write = { preHandler: ApiKeyAuth.require('write') };
     const code = (/** @type {FastifyRequest} */ r) => /** @type {{ code: string }} */ (r.params).code;
 
-    api.post('/links', { ...write, schema: { body: Schemas.create } }, async (request, reply) => {
+    api.post('/links', { config: { audit: AuditClient.route('shortlink.link.create', (_r, b) => ({ type: 'link', id: b.link.code })) }, ...write, schema: { body: Schemas.create } }, async (request, reply) => {
       const row = s.create(/** @type {any} */ (request.body), request.apiKeyId);
       reply.header('location', `/v1/links/${row.code}`);
       return reply.code(201).send({ link: this.views.link(row) });
@@ -174,11 +178,11 @@ export class ShortlinkApi {
 
     api.get('/links/:code', { ...read, schema: { params: Schemas.codeParams } }, async (request) => ({ link: this.views.link(s.get(code(request))) }));
 
-    api.patch('/links/:code', { ...write, schema: { params: Schemas.codeParams, body: Schemas.patch } }, async (request) => ({
+    api.patch('/links/:code', { config: { audit: AuditClient.route('shortlink.link.update', (r) => ({ type: 'link', id: /** @type {any} */ (r.params).code }), (r) => ({ patch: r.body })) }, ...write, schema: { params: Schemas.codeParams, body: Schemas.patch } }, async (request) => ({
       link: this.views.link(s.update(code(request), /** @type {any} */ (request.body))),
     }));
 
-    api.delete('/links/:code', { ...write, schema: { params: Schemas.codeParams } }, async (request, reply) => {
+    api.delete('/links/:code', { config: { audit: AuditClient.route('shortlink.link.delete', (r) => ({ type: 'link', id: /** @type {any} */ (r.params).code })) }, ...write, schema: { params: Schemas.codeParams } }, async (request, reply) => {
       s.remove(code(request));
       return reply.code(204).send();
     });

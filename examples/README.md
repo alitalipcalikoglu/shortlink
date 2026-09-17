@@ -13,6 +13,7 @@ Scenario-driven walkthroughs of every feature. Requests to `/v1/*` need `Authori
 | [API keys and roles](keys-and-roles.md) | Read, write, readwrite keys; rate limits |
 | [Privacy and retention](privacy.md) | What is stored about visitors, hashing, click retention |
 | [Operations](operations.md) | Health, readiness, metrics, environment, PM2, Docker, reverse proxy |
+| [Audit events](audit-events.md) | Which write actions are forwarded to the audit service, event shape, configuration |
 
 Set up once for the examples:
 
