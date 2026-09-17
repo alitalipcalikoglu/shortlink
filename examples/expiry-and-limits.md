@@ -18,6 +18,8 @@ slcurl -X POST $SL/v1/links -d '{"url":"https://example.com/download/report.pdf"
 
 Only counted clicks consume the limit. Requests whose user agent looks like a crawler, link checker or chat preview fetcher (`bot` device class) are logged but do not count, so a link pasted into a chat is not spent by the chat app's preview.
 
+`maxClicks` is enforced atomically at the database level (one conditional `UPDATE`, not a read-then-check-then-write): a link created with `"maxClicks":1` grants **exactly** one successful redirect, even if many requests race in at the same instant — including from separate processes sharing the database. There is never a window where two concurrent requests both see "not yet exhausted" and both succeed.
+
 ## Disabling instead of deleting
 
 ```bash

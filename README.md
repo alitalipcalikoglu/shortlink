@@ -49,7 +49,7 @@ npm run typecheck
 
 **Responsibilities:** create/manage links; redirect; click counting; expiry and max-click limits; QR codes.
 
-**Non-responsibilities:** not an analytics platform — click counts only, no referrer/funnel analysis. The max-click limit is currently enforced by a read-then-write check, not an atomic SQL guard — a known race under heavy concurrent hits on the same code, tracked as a pre-existing gap and not changed here. Not a general redirect/proxy service beyond its own link table.
+**Non-responsibilities:** not an analytics platform — click counts only, no referrer/funnel analysis. The max-click limit is enforced by an atomic conditional SQL `UPDATE`, not a read-then-write check — safe under concurrent hits on the same code, including across separate processes/connections sharing the database (see "Scaling model" below). Not a general redirect/proxy service beyond its own link table.
 
 ## API
 
@@ -134,12 +134,14 @@ With `AUDIT_URL` and `AUDIT_API_KEY` set, every completed write request is forwa
 
 ## Scaling model
 
-One process owns one SQLite file (`instances: 1`). Create/list/stats paths would stay consistent
-across two instances thanks to SQLite's own write locking, but the public redirect path is not: it
-reads a link's click count, decides whether `maxClicks` still allows it, and only then writes —  a
-classic read-then-write, not a conditional `UPDATE`. Single-process traffic can't race this (no
-`await` between the read and the write), but two processes sharing one file could push a link's
-click count past `maxClicks`. See [docs/READINESS.md](docs/READINESS.md) for the full contract.
+One process owns one SQLite file (`instances: 1`). Every write path, including the public redirect
+path, stays consistent across any number of connections or processes sharing that file — `maxClicks`
+enforcement is one atomic conditional `UPDATE`
+(`clicks = clicks + 1 ... WHERE ... clicks < max_clicks`), not a read-then-decide-then-write, so a
+link with `maxClicks = N` can never accumulate more than `N` successful redirects no matter how many
+processes are serving it concurrently. This is SQLite's own write serialization doing the work, not
+a process-local lock. See [docs/READINESS.md](docs/READINESS.md) for the full contract and the
+real cross-connection concurrency tests that prove it.
 
 ## Observability
 

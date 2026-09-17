@@ -131,22 +131,61 @@ export class LinkService {
   /**
    * Resolve a code for redirection and record the click. Bots are counted in the click log
    * with `device = bot` but do not consume `maxClicks`.
+   *
+   * Correctness: for a link with `maxClicks = N`, any number of concurrent callers (same process
+   * or different processes/connections sharing the database) can never produce more than N
+   * successful (non-bot) resolves between them. `links.hitIfActive()` is a single atomic
+   * conditional `UPDATE` — the "still under the limit" check and the increment happen in one
+   * statement, so there is no read-then-write gap for two callers to both observe "not yet
+   * exhausted" and both succeed. This holds across connections/processes, not just within one:
+   * SQLite itself (WAL + a busy-timeout, see `db.js`) serializes the writes, not a process-local
+   * mutex — the same guarantee would hold even with no in-process concurrency at all.
    * @param {string} code
    * @param {Hit} hit
    * @param {number} [now]
    * @returns {{ url: string, permanent: boolean }}
    */
   follow(code, hit, now = Date.now()) {
-    const row = this.links.byCode(code);
-    if (!row) throw new LinkError('LINK_NOT_FOUND', 'link not found');
-    const status = LinkService.status(row, now);
-    if (status !== 'active') throw new LinkError('LINK_GONE', `link is ${status}`, { status });
     const device = Visitor.device(hit.userAgent);
+    if (device === 'bot') {
+      // Bots never consume maxClicks, so there is nothing to make atomic for them — a plain read
+      // is exactly as safe here as it always was.
+      const row = this.links.byCode(code);
+      if (!row) throw new LinkError('LINK_NOT_FOUND', 'link not found');
+      const status = LinkService.status(row, now);
+      if (status !== 'active') throw new LinkError('LINK_GONE', `link is ${status}`, { status });
+      this.db.transaction(() => {
+        this.clicks.record({ code, at: now, visitor: this.visitor.hash(hit.ip, hit.userAgent), referrer: Visitor.referrerHost(hit.referer, this.options.publicHost), device });
+      });
+      return { url: row.url, permanent: row.permanent === 1 };
+    }
+
+    let claimed = false;
     this.db.transaction(() => {
-      this.clicks.record({ code, at: now, visitor: this.visitor.hash(hit.ip, hit.userAgent), referrer: Visitor.referrerHost(hit.referer, this.options.publicHost), device });
-      if (device !== 'bot') this.links.hit(code, now);
+      claimed = this.links.hitIfActive(code, now);
+      if (claimed) this.clicks.record({ code, at: now, visitor: this.visitor.hash(hit.ip, hit.userAgent), referrer: Visitor.referrerHost(hit.referer, this.options.publicHost), device });
     });
+    if (!claimed) throw LinkService.#followFailure(this.links.byCode(code), now);
+    const row = /** @type {LinkRow} */ (this.links.byCode(code));
     return { url: row.url, permanent: row.permanent === 1 };
+  }
+
+  /**
+   * Classifies why `hitIfActive` returned false — not found, disabled, expired, or exhausted.
+   * This read cannot itself grant an extra click (the atomic attempt already happened and
+   * failed), so it is purely explanatory, never part of the correctness primitive itself. In the
+   * vanishingly narrow window where a concurrent admin change (e.g. raising `maxClicks`) makes the
+   * row look `active` again by the time of this read, the failure is still reported as
+   * `exhausted` — `hitIfActive` is the one true answer for whether a click was granted; this is
+   * only ever about the wording of the error.
+   * @param {LinkRow|undefined} row
+   * @param {number} now
+   */
+  static #followFailure(row, now) {
+    if (!row) return new LinkError('LINK_NOT_FOUND', 'link not found');
+    const status = LinkService.status(row, now);
+    const reported = status === 'active' ? 'exhausted' : status;
+    return new LinkError('LINK_GONE', `link is ${reported}`, { status: reported });
   }
 
   /**

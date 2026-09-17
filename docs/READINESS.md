@@ -164,40 +164,57 @@ or validating that a destination URL actually resolves (`shortlink` never fetche
 **B — single-node stateful**: one process owns one SQLite file, `instances: 1` pinned in
 `ecosystem.config.cjs` with the same "one process per SQLite file" comment as `flags`.
 
-Two instances against the same file: the **create/list/stats/read paths** would be no less safe
-than `flags`' equivalents — SQLite's own WAL locking serializes writes across processes. The
-**redirect path (`GET /:code`) is the one that matters most here**, and it is **not safe** for two
-processes sharing one file, specifically for `maxClicks` enforcement:
+Two instances against the same file: the **create/list/stats/read paths** are no less safe than
+`flags`' equivalents — SQLite's own WAL locking serializes writes across processes. The
+**redirect path (`GET /:code`)** used to be the one exception (see below); as of Stage 10 it is
+safe across any number of processes/connections sharing the file too, for the same reason: the
+enforcement is now itself a single SQLite write, not application-level logic straddling a read and
+a write.
 
-`LinkService.follow()` reads the link row (`this.links.byCode(code)`), computes `status` from that
-already-read `row.clicks` vs `row.max_clicks` (`LinkService.status`), and only *then* opens a
-`db.transaction()` that inserts the click row and calls `this.links.hit(code, now)`. `hit()`
-(`src/store/link-store.js`) is an **unconditional increment** —
-`UPDATE links SET clicks = clicks + 1, last_click_at = ? WHERE code = ?` — not a conditional update
-guarded by `AND clicks < max_clicks`. Within a single process this is not exploitable: `follow()`
-contains no `await` between the read and the write, and `node:sqlite`'s `DatabaseSync` is
-synchronous, so the whole function runs to completion on the event loop with no interleaving
-possible between two concurrent requests to the *same* process — the second request's `byCode` read
-always happens after the first request's `hit()` has already committed. **Across two processes
-sharing the same file, that guarantee disappears**: both processes can read the same
-`row.clicks = maxClicks - 1` at effectively the same instant, both compute `status = 'active'`, and
-both proceed to record a click and increment — the counter can exceed `max_clicks` by as many as
-there are genuinely concurrent cross-process requests at the boundary. `BEGIN IMMEDIATE` inside
-`db.transaction()` serializes the *writes* themselves (one process's transaction blocks the other's
-until it commits) but does nothing to prevent this, because the decision to proceed was already made
-from a stale read taken *before* the transaction opened.
+**`maxClicks` enforcement (Stage 10 fix — atomic conditional `UPDATE`)**: `LinkService.follow()` no
+longer reads the row, decides in application code, and only then writes. For every non-bot hit it
+calls `LinkStore#hitIfActive(code, now)`, one statement —
+
+```sql
+UPDATE links SET clicks = clicks + 1, last_click_at = ?
+WHERE code = ? AND enabled = 1 AND (expires_at IS NULL OR expires_at > ?)
+  AND (max_clicks IS NULL OR clicks < max_clicks)
+```
+
+— where the "still allowed" check and the increment happen atomically, in the database, in the same
+statement. SQLite guarantees this regardless of how many connections or processes are hitting the
+same row at once (WAL + `busy_timeout`, see `src/db.js`): whichever attempt's `UPDATE` actually
+commits first has already made `clicks < max_clicks` false for everyone still waiting, so a link
+with `max_clicks = N` can never accumulate more than `N` successful (non-bot) resolves, no matter
+how many processes serve its redirects concurrently. There is no process-local mutex or lock
+involved anywhere in this — the correctness primitive is SQLite's own write serialization on the
+conditional `UPDATE`, which is exactly why this also holds across separate processes, not just
+within one. `changes === 0` doesn't say why by itself; `follow()` then does one plain, non-atomic
+`byCode()` read purely to classify the failure as `LINK_NOT_FOUND`, `expired`, `disabled`, or
+`exhausted` for the error response — that read cannot itself grant an extra click (the atomic
+attempt already ran and failed), so it carries no race risk of its own. Bots are unaffected: they
+never consume `maxClicks`, so their status check remains a plain read exactly as before (nothing
+about their path was ever part of this race).
+
+Proven with real cross-connection concurrency, not simulated in-process interleaving:
+`test/concurrency.test.js` spawns several `node:worker_threads` workers, each opening its OWN
+`DatabaseSync` connection to the same on-disk file, all calling `follow()` on the same code at once.
+`max_clicks = 1` with 2 concurrent resolvers → exactly 1 succeeds, the other gets a deterministic
+`410 LINK_GONE` ("link is exhausted"), never a corrupted or double count. `max_clicks = N` under
+higher concurrency (40 resolvers, N = 10) → exactly N succeed. These tests are written to fail
+against the pre-Stage-10 (`hit()`, unconditional-increment) code — they were run against it and did
+fail, confirming they exercise the real race, not a vacuous check.
 
 The housekeeping/cleanup worker (`Maintenance`, hourly `clicks.purge()`) running twice would simply
 issue the same `DELETE FROM clicks WHERE at < ?` twice — wasted work, not a correctness problem,
 since a `DELETE` with no matching rows the second time is a safe no-op.
 
 ## Single-node / multi-node guarantees
-Running more than one `shortlink` instance against the same `DB_PATH` today is unsupported: reads
-and most writes would stay individually consistent (SQLite's own locking), but `maxClicks`
-enforcement on the redirect path can be violated by concurrent cross-process traffic (see above) —
-a link can accumulate more clicks than `max_clicks` once two processes are both serving its
-redirects. There is no shared cache, no coordination, no leader election; only the shipped
-single-instance topology has been exercised or is claimed safe.
+Running more than one `shortlink` instance against the same `DB_PATH` is not a *supported, exercised
+topology* (still pinned to `instances: 1` — no coordination, no shared cache, no leader election —
+this is unchanged), but as of Stage 10 there is no longer a known correctness gap that a second
+instance would expose: every write path, including the redirect/`maxClicks` path, is safe under
+real concurrent, cross-process traffic against the same file.
 
 ## Known failure modes
 - **Disk full**: a write inside `db.transaction()` throws, rolls back, and the redirect (or
@@ -209,8 +226,7 @@ single-instance topology has been exercised or is claimed safe.
   SQLite file itself should stay consistent (WAL, atomic commits), but the in-flight request being
   served gets no response, and a request whose click-insert committed but whose HTTP response never
   went out would be recorded as a click with no confirmation reaching the client.
-- **Two instances run against one file**: unsupported; specifically, the redirect path's
-  `maxClicks` enforcement (read-then-write, not a conditional `UPDATE`) can be exceeded under
-  concurrent cross-process traffic, as detailed under Scaling model above — this is the one
-  concurrency risk in this service that a second instance would actually expose in production
-  behaviour, not just in metrics bookkeeping.
+- **Two instances run against one file**: not a topology this service is deployed as (`instances: 1`
+  in `ecosystem.config.cjs`, no coordination between instances), but as of Stage 10 it is no longer
+  a known correctness risk if it happened — `maxClicks` enforcement is now a single atomic
+  conditional `UPDATE`, safe under concurrent cross-process writers.

@@ -16,6 +16,12 @@ export class LinkStore {
       update: db.prepare(`UPDATE links SET url = ?, permanent = ?, enabled = ?, expires_at = ?, max_clicks = ?, tags = ?, note = ?, updated_at = ? WHERE code = ?`),
       remove: db.prepare(`DELETE FROM links WHERE code = ?`),
       hit: db.prepare(`UPDATE links SET clicks = clicks + 1, last_click_at = ? WHERE code = ?`),
+      // The maxClicks correctness primitive: the increment and the "still allowed" check happen in
+      // the SAME statement, so there is no read-then-write gap for two concurrent resolves to both
+      // slip through. SQLite's own locking (WAL + busy_timeout, see db.js) serializes this across
+      // every connection/process sharing the file — not just within one process.
+      hitIfActive: db.prepare(`UPDATE links SET clicks = clicks + 1, last_click_at = ?
+        WHERE code = ? AND enabled = 1 AND (expires_at IS NULL OR expires_at > ?) AND (max_clicks IS NULL OR clicks < max_clicks)`),
       counts: db.prepare(`SELECT
         COUNT(*) AS total,
         SUM(CASE WHEN enabled = 1 AND (expires_at IS NULL OR expires_at > ?) AND (max_clicks IS NULL OR clicks < max_clicks) THEN 1 ELSE 0 END) AS active,
@@ -58,6 +64,19 @@ export class LinkStore {
    */
   hit(code, at) {
     return Number(this.stmt.hit.run(at, code).changes) > 0;
+  }
+
+  /**
+   * Atomically increments `clicks` only if the link is still active (enabled, unexpired, under
+   * `max_clicks`) — the compare-and-increment that makes `maxClicks` correct under real
+   * concurrency. `false` doesn't say WHY (not found vs. disabled vs. expired vs. exhausted); a
+   * caller that needs the reason does a plain follow-up `byCode()` read, which is safe precisely
+   * because it can no longer grant an extra click — the counting already happened, or didn't.
+   * @param {string} code
+   * @param {number} now
+   */
+  hitIfActive(code, now) {
+    return Number(this.stmt.hitIfActive.run(now, code, now).changes) > 0;
   }
 
   /**
