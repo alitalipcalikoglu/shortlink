@@ -18,7 +18,7 @@ test('Config: rejects bad input', () => {
   const bad = (/** @type {Record<string,string>} */ o, /** @type {RegExp} */ re) => assert.throws(() => Config.fromEnv(testEnv(o)), (e) => e instanceof ConfigError && re.test(e.message));
   bad({ SHORTLINK_API_KEYS: '' }, /SHORTLINK_API_KEYS is required/);
   bad({ SHORTLINK_API_KEYS: 'shop:short' }, /at least 32/);
-  bad({ SHORTLINK_API_KEYS: `a:${'a'.repeat(40)}:admin` }, /read, write or readwrite/);
+  bad({ SHORTLINK_API_KEYS: `a:${'a'.repeat(40)}:admin` }, /one of read, write, readwrite/); // wording now matches every other service's role-list message (service-core's parseApiKeys)
   bad({ PUBLIC_BASE_URL: 'https://s.test/path' }, /bare origin/);
   bad({ PUBLIC_BASE_URL: 'ftp://s.test' }, /bare origin/);
   bad({ HASH_SECRET: 'short' }, /HASH_SECRET must be at least 32/);
