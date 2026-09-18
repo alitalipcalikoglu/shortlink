@@ -142,7 +142,7 @@ emitted: `traceId`, `spanId`, `route`/`op` (raw `req.url` only), `durationMs` (F
 ## Tracing
 Accepts whatever `X-Request-Id` the caller sends (no trust gate — internal service reached only via
 gateway, console or peers) and generates one when absent. Does **not** parse, forward, or log
-`traceparent` — implemented in `gateway` only, as of this review's Stage 1. No outbound HTTP calls
+`traceparent` — implemented in `gateway` and `console` (Stage 10). No outbound HTTP calls
 happen in the request path (the audit call is async and off-path and does not forward any
 request-scoped header), so there's nothing to propagate onward regardless.
 

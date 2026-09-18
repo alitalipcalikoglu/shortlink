@@ -134,7 +134,7 @@ With `AUDIT_URL` and `AUDIT_API_KEY` set, every completed write request is forwa
 
 ## Scaling model
 
-One process owns one SQLite file (`instances: 1`). Every write path, including the public redirect
+**B — single-node stateful.** One process owns one SQLite file (`instances: 1`). Every write path, including the public redirect
 path, stays consistent across any number of connections or processes sharing that file — `maxClicks`
 enforcement is one atomic conditional `UPDATE`
 (`clicks = clicks + 1 ... WHERE ... clicks < max_clicks`), not a read-then-decide-then-write, so a
@@ -146,7 +146,7 @@ real cross-connection concurrency tests that prove it.
 ## Observability
 
 Requests are logged with `reqId` (accepts or generates `X-Request-Id`; no `traceparent` support —
-gateway-only so far). `/health` is a static check; `/ready` pings the database, cached for 10s, and
+implemented in gateway and console so far). `/health` is a static check; `/ready` pings the database, cached for 10s, and
 never mutates state. `/metrics` numbers are all live database reads, so they don't reset on restart
 or diverge between processes. See [docs/READINESS.md](docs/READINESS.md) for the full contract.
 
