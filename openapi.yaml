@@ -1,0 +1,1051 @@
+openapi: 3.1.0
+info:
+  title: shortlink
+  version: 1.0.0
+  description: |
+    Short links over HTTP: redirects with expiry and click limits, click statistics, QR codes as
+    SVG or PNG.
+
+    ## Auth zones
+    This service has two genuinely separate auth zones:
+
+    - **Management API** (`/v1/*`, `GET /metrics`) — Bearer API key (`Authorization: Bearer <secret>`).
+      Keys carry a role: `read`, `write`, or `readwrite` (satisfies both `read`- and `write`-gated
+      routes). A key without the required role gets `403 FORBIDDEN`; a missing/invalid key gets
+      `401 UNAUTHORIZED`.
+    - **Public zone** (`GET /{code}`, `GET /{code}/qr`, `GET /robots.txt`) — no authentication at
+      all, reachable by any browser, rate limited per client address instead of per key. `GET
+      /health`, `GET /ready` and `GET /v1/info` are also unauthenticated (operational/discovery
+      endpoints), but sit outside both the `/v1` management surface and the public redirect/QR
+      surface.
+
+    ## Error envelope
+    Every error response, from every route, uses one shape: `{ "error": { "code", "message",
+    "details"? } }`. `details` is present only for a handful of codes (validation failures, link
+    gone with its status, patch failure context) — omitted otherwise.
+tags:
+  - name: Links
+    description: Management CRUD over short links (`/v1/links*`).
+  - name: QR
+    description: QR code images — management, public, and arbitrary-text variants.
+  - name: Stats
+    description: Click statistics, per-link and service-wide.
+  - name: Redirect
+    description: The public redirect/preview route.
+  - name: Operational
+    description: Health, readiness, service info, metrics.
+paths:
+  # ---------------------------------------------------------------------------------------------
+  # Operational — unauthenticated, outside both the /v1 management surface and the public zone.
+  # ---------------------------------------------------------------------------------------------
+  /health:
+    get:
+      operationId: shortlink.health.get
+      summary: Liveness probe
+      description: Always `200`. Does not check any dependency.
+      tags: [Operational]
+      security: []
+      x-stack-visibility: public
+      responses:
+        '200':
+          description: Process is up.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { type: string, enum: [ok] }
+
+  /ready:
+    get:
+      operationId: shortlink.ready.get
+      summary: Readiness probe
+      description: |
+        Runs `db.ping()`, result cached for 10 seconds. `200` when the database is reachable,
+        `503` otherwise.
+      tags: [Operational]
+      security: []
+      x-stack-visibility: public
+      responses:
+        '200':
+          description: Database is reachable.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { type: string, enum: [ok] }
+        '503':
+          description: Database is not reachable.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, error]
+                properties:
+                  status: { type: string, enum: [unavailable] }
+                  error: { type: string, description: The check's own error message. }
+
+  /v1/info:
+    get:
+      operationId: shortlink.info.get
+      summary: Service identity and capabilities
+      tags: [Operational]
+      security: []
+      x-stack-visibility: public
+      responses:
+        '200':
+          description: Instance identity.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [service, version, apiVersion, capabilities, schemaVersion, serviceCore]
+                properties:
+                  service: { type: string, enum: [shortlink] }
+                  version:
+                    type: string
+                    description: This service's own package semver — unrelated to `apiVersion`.
+                  apiVersion: { type: string, enum: [v1] }
+                  capabilities:
+                    type: array
+                    items: { type: string }
+                    description: Static list; always `["qr-codes", "click-limits"]` for this service.
+                    example: [qr-codes, click-limits]
+                  schemaVersion:
+                    type: integer
+                    description: The open SQLite database schema version (`PRAGMA user_version`).
+                  serviceCore:
+                    type: string
+                    description: Version of `@atc-web/service-core` actually running.
+
+  /robots.txt:
+    get:
+      operationId: shortlink.robots.get
+      summary: Robots exclusion file
+      description: |
+        Static `text/plain` response disallowing all crawling (`User-agent: *` / `Disallow: /`) —
+        short links are not meant to be indexed. Not rate limited (registered outside the public
+        rate-limited group).
+      tags: [Operational]
+      security: []
+      x-stack-visibility: public
+      responses:
+        '200':
+          description: Robots exclusion body.
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: |
+                  User-agent: *
+                  Disallow: /
+
+  # ---------------------------------------------------------------------------------------------
+  # Management API — Bearer API key required (read or write role per route).
+  # ---------------------------------------------------------------------------------------------
+  /metrics:
+    get:
+      operationId: shortlink.metrics.get
+      summary: Prometheus metrics
+      description: |
+        Authenticated (any valid key with `read` access — `read` or `readwrite`), but **not**
+        subject to the `/v1` rate limiter (registered in its own ops group, not under `/v1`) — a
+        deliberate, platform-wide convention so a fixed-schedule scraper is never throttled.
+      tags: [Operational]
+      security:
+        - ApiKeyAuth: []
+      x-stack-visibility: operational
+      responses:
+        '200':
+          description: Prometheus text-format exposition.
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: |
+                  # HELP shortlink_links Links by state.
+                  # TYPE shortlink_links gauge
+                  shortlink_links{state="active"} 12
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /v1/links:
+    post:
+      operationId: shortlink.links.create
+      summary: Create a short link
+      description: |
+        Requires the `write` role. `slug` is optional — omitted, a random unbiased base62 code of
+        the configured length is generated (retried up to 5 times against collisions/reserved
+        words before failing hard with a 500, which is not a modeled `LinkError`). When given, the
+        slug must match `^[A-Za-z0-9][A-Za-z0-9_-]{2,63}$` (identical to the request-body schema's
+        own pattern for `slug`, so a malformed slug is rejected as `400 VALIDATION_FAILED` before
+        the domain layer ever runs — the domain layer's own "bad format" `SLUG_RESERVED` check
+        exists only as defense-in-depth for callers of the domain service outside this HTTP API,
+        and is not reachable through this endpoint). A syntactically valid slug can still fail as
+        `SLUG_RESERVED` when it collides with a reserved platform word (`v1`, `health`, `ready`,
+        `metrics`, `qr`, `api`, `admin`, `favicon.ico`, `robots.txt`, `sitemap.xml`, `.well-known`,
+        case-insensitively) or as `SLUG_TAKEN` when already in use.
+      tags: [Links]
+      security:
+        - ApiKeyAuth: []
+      x-stack-visibility: authenticated
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LinkCreate'
+      responses:
+        '201':
+          description: Link created.
+          headers:
+            Location:
+              description: '`/v1/links/{code}` of the new link.'
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [link]
+                properties:
+                  link:
+                    $ref: '#/components/schemas/Link'
+        '400':
+          description: Bad request — one of `VALIDATION_FAILED`, `INVALID_URL`, `HOST_BLOCKED`, `INVALID_EXPIRY`, or `SLUG_RESERVED` (see description).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/SlugTaken'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+    get:
+      operationId: shortlink.links.list
+      summary: List links
+      description: Requires `read` access. Keyset pagination, newest first.
+      tags: [Links]
+      security:
+        - ApiKeyAuth: []
+      x-stack-visibility: authenticated
+      parameters:
+        - $ref: '#/components/parameters/ListQ'
+        - $ref: '#/components/parameters/ListTag'
+        - $ref: '#/components/parameters/ListStatus'
+        - $ref: '#/components/parameters/ListCreatedBy'
+        - $ref: '#/components/parameters/ListLimit'
+        - $ref: '#/components/parameters/ListCursor'
+      responses:
+        '200':
+          description: Page of links.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LinkList'
+        '400':
+          description: '`VALIDATION_FAILED` (bad query parameter) or `INVALID_CURSOR` (malformed `cursor`).'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/links/{code}:
+    get:
+      operationId: shortlink.links.get
+      summary: Get a link
+      description: Requires `read` access.
+      tags: [Links]
+      security:
+        - ApiKeyAuth: []
+      x-stack-visibility: authenticated
+      parameters:
+        - $ref: '#/components/parameters/CodeParam'
+      responses:
+        '200':
+          description: The link.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [link]
+                properties:
+                  link:
+                    $ref: '#/components/schemas/Link'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/LinkNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+    patch:
+      operationId: shortlink.links.patch
+      summary: Update a link
+      description: |
+        Requires the `write` role. Partial update — every property is optional but at least one
+        must be present; only the properties given are changed. `enabled` and `slug`-independent
+        fields only; the code/slug itself is never patchable.
+      tags: [Links]
+      security:
+        - ApiKeyAuth: []
+      x-stack-visibility: authenticated
+      parameters:
+        - $ref: '#/components/parameters/CodeParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LinkPatch'
+      responses:
+        '200':
+          description: The updated link.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [link]
+                properties:
+                  link:
+                    $ref: '#/components/schemas/Link'
+        '400':
+          description: One of `VALIDATION_FAILED`, `INVALID_URL`, or `INVALID_EXPIRY`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/LinkNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+    delete:
+      operationId: shortlink.links.delete
+      summary: Delete a link
+      description: Requires the `write` role. Permanent — the code becomes available for reuse.
+      tags: [Links]
+      security:
+        - ApiKeyAuth: []
+      x-stack-visibility: authenticated
+      parameters:
+        - $ref: '#/components/parameters/CodeParam'
+      responses:
+        '204':
+          description: Deleted. No body.
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/LinkNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/links/{code}/stats:
+    get:
+      operationId: shortlink.links.getStats
+      summary: Click statistics for one link
+      description: Requires `read` access. `days` is the lookback window (default 7 is service-wide; this route's own default is 30).
+      tags: [Stats]
+      security:
+        - ApiKeyAuth: []
+      x-stack-visibility: authenticated
+      parameters:
+        - $ref: '#/components/parameters/CodeParam'
+        - $ref: '#/components/parameters/DaysParam'
+      responses:
+        '200':
+          description: Click statistics.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LinkStats'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/LinkNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/links/{code}/qr:
+    get:
+      operationId: shortlink.links.getQr
+      summary: QR code for a link (management)
+      description: |
+        Requires `read` access. Unlike the public `GET /{code}/qr`, this works on a link in **any**
+        status (active, disabled, expired, exhausted) — it is a management convenience, not a
+        gate on whether the link still redirects. Encodes the link's short URL, not arbitrary text.
+      tags: [QR]
+      security:
+        - ApiKeyAuth: []
+      x-stack-visibility: authenticated
+      parameters:
+        - $ref: '#/components/parameters/CodeParam'
+        - $ref: '#/components/parameters/QrFormat'
+        - $ref: '#/components/parameters/QrScale'
+        - $ref: '#/components/parameters/QrMargin'
+      responses:
+        '200':
+          $ref: '#/components/responses/QrImage'
+        '304':
+          $ref: '#/components/responses/QrNotModified'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/LinkNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/qr:
+    get:
+      operationId: shortlink.qr.getForText
+      summary: QR code for arbitrary text
+      description: |
+        Requires `read` access. Encodes the caller-supplied `text` query parameter verbatim — not
+        tied to any link/code. `413`-equivalent case: text that does not fit the largest supported
+        QR version (213 bytes, UTF-8 encoded) fails as `400 QR_TOO_LONG`.
+      tags: [QR]
+      security:
+        - ApiKeyAuth: []
+      x-stack-visibility: authenticated
+      parameters:
+        - $ref: '#/components/parameters/QrText'
+        - $ref: '#/components/parameters/QrFormat'
+        - $ref: '#/components/parameters/QrScale'
+        - $ref: '#/components/parameters/QrMargin'
+      responses:
+        '200':
+          $ref: '#/components/responses/QrImage'
+        '304':
+          $ref: '#/components/responses/QrNotModified'
+        '400':
+          description: '`VALIDATION_FAILED` (missing/malformed query, including a missing `text`) or `QR_TOO_LONG` (text exceeds QR capacity).'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/stats:
+    get:
+      operationId: shortlink.stats.get
+      summary: Service-wide click statistics
+      description: Requires `read` access. `days` lookback window, default 7.
+      tags: [Stats]
+      security:
+        - ApiKeyAuth: []
+      x-stack-visibility: authenticated
+      parameters:
+        - $ref: '#/components/parameters/DaysParam'
+      responses:
+        '200':
+          description: Overview statistics.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatsOverview'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  # ---------------------------------------------------------------------------------------------
+  # Public zone — no authentication, rate limited per client address (separate bucket from /v1).
+  # ---------------------------------------------------------------------------------------------
+  /{code}/qr:
+    get:
+      operationId: shortlink.qr.getPublic
+      summary: QR code for a link (public)
+      description: |
+        No authentication. Works only when the link's current status is `active` — any other
+        status (disabled, expired, exhausted) responds `410 LINK_GONE` instead of an image, unlike
+        the management `GET /v1/links/{code}/qr`, which works on any status. An unknown or
+        malformed code responds `404 LINK_NOT_FOUND`. Rate limited per client address (the public
+        bucket, `REDIRECT_RATE_LIMIT_MAX`, distinct from the `/v1` per-key bucket).
+      tags: [QR]
+      security: []
+      x-stack-visibility: public
+      parameters:
+        - $ref: '#/components/parameters/PublicCodeParam'
+        - $ref: '#/components/parameters/QrFormat'
+        - $ref: '#/components/parameters/QrScale'
+        - $ref: '#/components/parameters/QrMargin'
+      responses:
+        '200':
+          $ref: '#/components/responses/QrImage'
+        '304':
+          $ref: '#/components/responses/QrNotModified'
+        '404':
+          $ref: '#/components/responses/LinkNotFound'
+        '410':
+          $ref: '#/components/responses/LinkGone'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /{code}:
+    get:
+      operationId: shortlink.redirect.follow
+      summary: Follow a short link, or preview it
+      description: |
+        No authentication. One route, two behaviors selected purely by whether the `code` path
+        segment ends with a literal `+`:
+
+        - **Redirect branch** (no trailing `+`, e.g. `GET /abc1234`): resolves the code and,
+          if the link is active, responds with a redirect — empty body, `Location` header set to
+          the target URL, status `301` when the link's own `permanent` flag is true or `302`
+          otherwise. `Cache-Control` follows the same split: `public, max-age=86400` for a `301`,
+          `private, max-age=0, no-cache` for a `302`. Every resolve is recorded in the click log;
+          for a link with `maxClicks` set, a real (non-bot) click atomically consumes one of the
+          remaining clicks — concurrent callers can never together consume more than the
+          configured limit. A request whose `User-Agent` matches a bot signature is logged but
+          never consumes `maxClicks`. If the link is not active (disabled, expired, or exhausted;
+          "exhausted" is also reported for an already-inactive link with no remaining clicks),
+          responds `410 LINK_GONE` with a JSON error body instead of redirecting. An unknown code
+          responds `404 LINK_NOT_FOUND`. Neither error case redirects or serves HTML.
+        - **Preview branch** (trailing `+`, e.g. `GET /abc1234+`): strips the `+`, resolves the
+          code (any status, no `LINK_GONE` check — the page itself shows the status), and responds
+          `200 text/html` with a small preview page showing the destination URL, status,
+          created/expiry dates and a QR code (for an active link only). Nothing is recorded in the
+          click log for a preview view. An unknown code still responds `404 LINK_NOT_FOUND` (JSON).
+
+        A code whose shape does not match a link's own code pattern (`^[A-Za-z0-9][A-Za-z0-9_-]{2,63}$`
+        with the optional trailing `+`, up to 80 characters total) is treated identically to an
+        unknown code — `404 LINK_NOT_FOUND` — rather than a `400`, so probing does not distinguish
+        "malformed" from "well-formed but absent."
+
+        Rate limited per client address (the public bucket, `REDIRECT_RATE_LIMIT_MAX`).
+      tags: [Redirect]
+      security: []
+      x-stack-visibility: public
+      parameters:
+        - $ref: '#/components/parameters/PublicCodeParam'
+      responses:
+        '301':
+          description: Permanent redirect (redirect branch, link's `permanent` is true). Empty body.
+          headers:
+            Location:
+              description: The link's target URL.
+              schema: { type: string }
+            Cache-Control:
+              schema: { type: string, example: 'public, max-age=86400' }
+        '302':
+          description: Temporary redirect (redirect branch, link's `permanent` is false). Empty body.
+          headers:
+            Location:
+              description: The link's target URL.
+              schema: { type: string }
+            Cache-Control:
+              schema: { type: string, example: 'private, max-age=0, no-cache' }
+        '200':
+          description: Preview page (preview branch — code ends with `+`).
+          content:
+            text/html:
+              schema:
+                type: string
+        '404':
+          $ref: '#/components/responses/LinkNotFound'
+        '410':
+          description: Link exists but is not active (redirect branch only — the preview branch never returns this). See `LinkGone`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: http
+      scheme: bearer
+      description: |
+        `Authorization: Bearer <secret>`. Every configured key is compared in constant time.
+        Missing or unrecognized secret: `401 UNAUTHORIZED` with a `WWW-Authenticate: Bearer`
+        response header. Recognized key lacking the role a route requires: `403 FORBIDDEN`.
+
+  parameters:
+    CodeParam:
+      name: code
+      in: path
+      required: true
+      description: The link's short code.
+      schema:
+        $ref: '#/components/schemas/Code'
+
+    PublicCodeParam:
+      name: code
+      in: path
+      required: true
+      description: |
+        The link's short code, optionally suffixed with a literal `+` to request the preview page
+        instead of (or, for the QR route, in addition to gating on) the redirect/image. Any shape
+        that does not match a real code, once the optional `+` is stripped, is treated as an
+        unknown link (`404`), not a validation error — this parameter intentionally accepts any
+        short string rather than the strict code pattern.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 80
+
+    QrFormat:
+      name: format
+      in: query
+      required: false
+      schema:
+        type: string
+        enum: [svg, png]
+        default: svg
+
+    QrScale:
+      name: scale
+      in: query
+      required: false
+      description: PNG pixels per module, 1-20. Ignored for `format=svg`.
+      schema:
+        type: string
+        pattern: '^([1-9]|1[0-9]|20)$'
+        default: '8'
+
+    QrMargin:
+      name: margin
+      in: query
+      required: false
+      description: Quiet-zone modules, 0-8.
+      schema:
+        type: string
+        pattern: '^[0-8]$'
+        default: '4'
+
+    QrText:
+      name: text
+      in: query
+      required: true
+      description: Arbitrary text to encode.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 1024
+
+    DaysParam:
+      name: days
+      in: query
+      required: false
+      description: Lookback window in days, 1-399.
+      schema:
+        type: string
+        pattern: '^([1-9]|[1-9][0-9]|[1-3][0-9][0-9])$'
+
+    ListQ:
+      name: q
+      in: query
+      required: false
+      description: Free-text search over code and URL.
+      schema: { type: string, minLength: 1, maxLength: 200 }
+
+    ListTag:
+      name: tag
+      in: query
+      required: false
+      schema: { type: string, minLength: 1, maxLength: 40 }
+
+    ListStatus:
+      name: status
+      in: query
+      required: false
+      schema:
+        type: string
+        enum: [active, disabled, expired, exhausted]
+
+    ListCreatedBy:
+      name: createdBy
+      in: query
+      required: false
+      description: Filter by the API key id that created the link.
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9_-]{1,64}$'
+
+    ListLimit:
+      name: limit
+      in: query
+      required: false
+      description: Page size, 1-200. Default 50.
+      schema:
+        type: string
+        pattern: '^([1-9]|[1-9][0-9]|1[0-9][0-9]|200)$'
+
+    ListCursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque keyset cursor from a previous page's `nextCursor`.
+      schema: { type: string, maxLength: 200 }
+
+  schemas:
+    Code:
+      type: string
+      pattern: '^[A-Za-z0-9][A-Za-z0-9_-]{2,63}$'
+      description: 3-64 characters — letters, digits, `_` and `-`, starting with a letter or digit.
+
+    LinkStatus:
+      type: string
+      enum: [active, disabled, expired, exhausted]
+      description: |
+        `active`: enabled, unexpired, under `maxClicks` (or `maxClicks` unset). `disabled`:
+        `enabled` is false. `expired`: past `expiresAt`. `exhausted`: `clicks >= maxClicks`.
+        Checked in that precedence order.
+
+    Device:
+      type: string
+      enum: [bot, mobile, desktop, other]
+
+    Link:
+      type: object
+      description: The canonical link read shape, returned by every route that echoes a link.
+      required:
+        - code
+        - shortUrl
+        - previewUrl
+        - qrUrl
+        - url
+        - permanent
+        - enabled
+        - status
+        - expiresAt
+        - maxClicks
+        - clicks
+        - remainingClicks
+        - lastClickAt
+        - tags
+        - note
+        - createdBy
+        - createdAt
+        - updatedAt
+      properties:
+        code:
+          $ref: '#/components/schemas/Code'
+        shortUrl: { type: string, description: 'Public redirect URL (`{publicBaseUrl}/{code}`).' }
+        previewUrl: { type: string, description: 'Public preview URL (`{publicBaseUrl}/{code}+`).' }
+        qrUrl: { type: string, description: 'Public QR URL (`{publicBaseUrl}/{code}/qr`).' }
+        url: { type: string, description: Destination URL. }
+        permanent: { type: boolean, description: Whether the public redirect uses 301 (true) or 302 (false). }
+        enabled: { type: boolean }
+        status:
+          $ref: '#/components/schemas/LinkStatus'
+        expiresAt: { type: [string, 'null'], format: date-time }
+        maxClicks: { type: [integer, 'null'] }
+        clicks: { type: integer, description: Total recorded clicks (bots included). }
+        remainingClicks: { type: [integer, 'null'], description: '`maxClicks - clicks`, floored at 0; `null` when `maxClicks` is unset.' }
+        lastClickAt: { type: [string, 'null'], format: date-time }
+        tags:
+          type: array
+          items: { type: string }
+          description: Deduplicated, lower-cased, sorted.
+        note: { type: [string, 'null'] }
+        createdBy: { type: string, description: Id of the API key that created the link. }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    LinkCreate:
+      type: object
+      additionalProperties: false
+      required: [url]
+      properties:
+        url: { type: string, minLength: 8, maxLength: 8192, description: Must be an absolute http/https URL with no embedded credentials, not pointing at this service's own host, and not on the configured block list. }
+        slug:
+          $ref: '#/components/schemas/Code'
+        permanent: { type: boolean, description: 'Defaults to the service''s `DEFAULT_PERMANENT` config when omitted.' }
+        expiresAt: { type: [string, 'null'], maxLength: 40, description: ISO 8601 timestamp, must be in the future. }
+        maxClicks: { type: [integer, 'null'], minimum: 1, maximum: 1000000000 }
+        tags:
+          type: array
+          maxItems: 20
+          items: { type: string, minLength: 1, maxLength: 40, pattern: '^[^,]+$' }
+        note: { type: [string, 'null'], maxLength: 500 }
+
+    LinkPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      description: Every property is optional; at least one must be present. `code`/`slug` is never patchable.
+      properties:
+        url: { type: string, minLength: 8, maxLength: 8192 }
+        permanent: { type: boolean }
+        enabled: { type: boolean }
+        expiresAt: { type: [string, 'null'], maxLength: 40 }
+        maxClicks: { type: [integer, 'null'], minimum: 1, maximum: 1000000000 }
+        tags:
+          type: array
+          maxItems: 20
+          items: { type: string, minLength: 1, maxLength: 40, pattern: '^[^,]+$' }
+        note: { type: [string, 'null'], maxLength: 500 }
+
+    LinkList:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Link'
+        nextCursor:
+          type: [string, 'null']
+          description: Opaque keyset cursor for the next page, or `null` when this is the last page.
+
+    ClickRecent:
+      type: object
+      required: [at, visitor, referrer, device]
+      properties:
+        at: { type: string, format: date-time }
+        visitor: { type: string, description: 'Keyed HMAC hash of (address, user agent) — never the raw address.' }
+        referrer: { type: [string, 'null'], description: Referrer hostname, or null when absent/invalid/same-origin. }
+        device:
+          $ref: '#/components/schemas/Device'
+
+    ByDayEntry:
+      type: object
+      required: [day, clicks, visitors]
+      properties:
+        day: { type: string, description: 'UTC calendar day, `YYYY-MM-DD`.' }
+        clicks: { type: integer }
+        visitors: { type: integer, description: Distinct non-bot visitor hashes that day. }
+
+    ByReferrerEntry:
+      type: object
+      required: [referrer, clicks]
+      properties:
+        referrer: { type: [string, 'null'] }
+        clicks: { type: integer }
+
+    LinkStats:
+      type: object
+      required: [code, days, since, total, clicks, visitors, bots, byDay, byReferrer, byDevice, recent]
+      properties:
+        code:
+          $ref: '#/components/schemas/Code'
+        days: { type: integer, description: The lookback window requested. }
+        since: { type: string, format: date-time, description: 'Window start (`now - days`).' }
+        total: { type: integer, description: All-time clicks on the link (not window-limited). }
+        clicks: { type: integer, description: Clicks within the window (bots included). }
+        visitors: { type: integer, description: Distinct non-bot visitor hashes within the window. }
+        bots: { type: integer, description: Bot-classified clicks within the window. }
+        byDay:
+          type: array
+          items:
+            $ref: '#/components/schemas/ByDayEntry'
+        byReferrer:
+          type: array
+          maxItems: 10
+          items:
+            $ref: '#/components/schemas/ByReferrerEntry'
+          description: Top 10 referrer hostnames within the window, bots excluded.
+        byDevice:
+          type: object
+          additionalProperties: { type: integer }
+          description: Click count per `Device` value within the window, bots included.
+        recent:
+          type: array
+          maxItems: 20
+          items:
+            $ref: '#/components/schemas/ClickRecent'
+          description: Most recent 20 click-log rows for the link, newest first, independent of `days`.
+
+    TopLink:
+      type: object
+      required: [code, url, clicks, shortUrl]
+      properties:
+        code:
+          $ref: '#/components/schemas/Code'
+        url: { type: string }
+        clicks: { type: integer, description: Non-bot clicks within the window. }
+        shortUrl: { type: string }
+
+    StatsOverview:
+      type: object
+      required: [days, since, links, clicksInWindow, topLinks]
+      properties:
+        days: { type: integer }
+        since: { type: string, format: date-time }
+        links:
+          type: object
+          required: [total, active, clicks]
+          properties:
+            total: { type: integer }
+            active: { type: integer }
+            clicks: { type: integer, description: Sum of all-time clicks across every link. }
+        clicksInWindow: { type: integer, description: All click-log rows within the window (bots included). }
+        topLinks:
+          type: array
+          maxItems: 10
+          items:
+            $ref: '#/components/schemas/TopLink'
+
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string, description: 'Stable machine-readable code, e.g. `LINK_NOT_FOUND`.' }
+            message: { type: string }
+            details:
+              description: Present only for a subset of codes (validation failures, link-gone status, patch context).
+
+  responses:
+    Unauthorized:
+      description: Missing or unrecognized API key.
+      headers:
+        WWW-Authenticate:
+          schema: { type: string, example: Bearer }
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error: { code: UNAUTHORIZED, message: missing or invalid API key }
+
+    Forbidden:
+      description: Key is valid but lacks the role this route requires.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error: { code: FORBIDDEN, message: 'this API key has no write access' }
+
+    ValidationFailed:
+      description: Request failed JSON-Schema validation.
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/ErrorEnvelope'
+            example:
+              error:
+                code: VALIDATION_FAILED
+                message: body/url must NOT have fewer than 8 characters
+                details:
+                  - path: /url
+                    message: must NOT have fewer than 8 characters
+                    params: { limit: 8 }
+
+    RateLimited:
+      description: Self-throttle exceeded (per API key on `/v1/*`, per client address on the public zone).
+      headers:
+        X-RateLimit-Limit:
+          schema: { type: integer }
+        X-RateLimit-Remaining:
+          schema: { type: integer }
+        X-RateLimit-Reset:
+          schema: { type: integer }
+        Retry-After:
+          schema: { type: integer }
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error: { code: RATE_LIMITED, message: 'rate limit exceeded, retry in 42000ms' }
+
+    LinkNotFound:
+      description: No link with this code exists.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error: { code: LINK_NOT_FOUND, message: link not found }
+
+    LinkGone:
+      description: |
+        Link exists but is not active. `details.status` is one of `disabled`, `expired`, or
+        `exhausted` (never `active`) — for the public QR route this is a plain status read; for
+        the redirect route it is the outcome of the same atomic check that granted or denied the
+        click.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error: { code: LINK_GONE, message: 'link is expired', details: { status: expired } }
+
+    SlugTaken:
+      description: Requested `slug` is already in use by another link.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error: { code: SLUG_TAKEN, message: '"launch" is already in use' }
+
+    QrImage:
+      description: |
+        QR code image. `image/svg+xml` (default) or `image/png` depending on `format`. Cached
+        (`Cache-Control: public, max-age=86400`) with a strong `ETag` derived from the encoded
+        content and options.
+      headers:
+        Cache-Control:
+          schema: { type: string, example: 'public, max-age=86400' }
+        ETag:
+          schema: { type: string }
+      content:
+        image/svg+xml:
+          schema:
+            type: string
+        image/png:
+          schema:
+            type: string
+            format: binary
+
+    QrNotModified:
+      description: Client's `If-None-Match` matched the current `ETag`. Empty body.
+      headers:
+        Cache-Control:
+          schema: { type: string, example: 'public, max-age=86400' }
+        ETag:
+          schema: { type: string }
