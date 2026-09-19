@@ -35,6 +35,19 @@ tags:
   - name: Operational
     description: Health, readiness, service info, metrics.
 paths:
+  /openapi.yaml:
+    get:
+      operationId: shortlink.openapi
+      summary: Download the canonical OpenAPI document
+      description: Returns this service's repository-root OpenAPI 3.1 document byte-for-byte.
+      security: []
+      responses:
+        "200":
+          description: Canonical OpenAPI document.
+          content:
+            text/yaml:
+              schema: { type: string }
+
   # ---------------------------------------------------------------------------------------------
   # Operational — unauthenticated, outside both the /v1 management surface and the public zone.
   # ---------------------------------------------------------------------------------------------

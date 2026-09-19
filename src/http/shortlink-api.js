@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import rateLimit from '@fastify/rate-limit';
 import Fastify from 'fastify';
 import { AuditClient } from '@atc-web/service-core/audit';
-import { createErrorHandler, registerInfo, registerProbes, registerRequestContext, requestOptions } from '@atc-web/service-core/fastify';
+import { createErrorHandler, registerInfo, registerOpenApi, registerProbes, registerRequestContext, requestOptions } from '@atc-web/service-core/fastify';
 import { LinkError } from '../domain/errors.js';
 import { LinkService } from '../domain/link-service.js';
 import { Slug } from '../domain/slug.js';
@@ -78,6 +78,7 @@ export class ShortlinkApi {
       if (!reply.hasHeader('cache-control')) reply.header('cache-control', 'no-store');
     });
     registerProbes(app, () => this.db.ping(), { cacheMs: ShortlinkApi.READY_CACHE_MS });
+    registerOpenApi(app, new URL('../../openapi.yaml', import.meta.url));
     registerInfo(app, {
       service: 'shortlink',
       version: this.version,
