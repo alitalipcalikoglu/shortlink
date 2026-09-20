@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: shortlink
-  version: 1.0.0
+  version: 1.1.0
   description: |
     Short links over HTTP: redirects with expiry and click limits, click statistics, QR codes as
     SVG or PNG.
