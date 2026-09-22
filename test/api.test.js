@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
-import { readServiceVersion } from '@atc-web/service-core/fastify';
 import { Maintenance } from '../src/maintenance.js';
 import { BASE, READ_KEY, RW_KEY, WRITE_KEY, bearer, buildApp } from './helpers.js';
 
 const json = (/** @type {import('light-my-request').Response} */ r) => JSON.parse(r.body);
 const UA = { 'user-agent': 'Mozilla/5.0 (Macintosh) Chrome/130' };
+const PACKAGE_VERSION = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
 
 test('API: probes, auth, roles, robots', async (t) => {
   const { app } = await buildApp();
@@ -29,12 +29,11 @@ test('API: probes, auth, roles, robots', async (t) => {
 });
 
 test('API: /v1/info', async (t) => {
-  const version = readServiceVersion(import.meta.url);
   const { app } = await buildApp();
   t.after(() => app.close());
   const info = json(await app.inject({ url: '/v1/info' }));
   assert.equal(info.service, 'shortlink');
-  assert.equal(info.version, version);
+  assert.equal(info.version, PACKAGE_VERSION);
   assert.equal(info.apiVersion, 'v1');
   assert.deepEqual(info.capabilities, ['qr-codes', 'click-limits']);
   assert.equal(typeof info.schemaVersion, 'number');
